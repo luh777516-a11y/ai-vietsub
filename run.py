@@ -50,6 +50,13 @@ def get_audio_duration(file_path: str) -> float:
     try: return float(subprocess.run(cmd, stdout=subprocess.PIPE, text=True).stdout.strip())
     except: return 2.0
 
+def has_audio_stream(file_path: str) -> bool:
+    cmd = ["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=codec_type", "-of", "default=noprint_wrappers=1:nokey=1", file_path]
+    try:
+        out = subprocess.run(cmd, stdout=subprocess.PIPE, text=True).stdout.strip()
+        return "audio" in out.lower()
+    except: return False
+
 def clean_timestamp_str(t: str) -> str:
     t = t.strip().replace('.', ',')
     parts = t.split(':')
@@ -122,13 +129,12 @@ def get_srt_from_gemini_auto(video_path: str, model_list=CONFIG["models"], outpu
 
     return output_srt
 
-# TỰ ĐỘNG CHỤP ĐÚNG LÚC NHÂN VẬT NÓI ĐỂ SOI TOẠ ĐỘ SUB CHUẨN XÁC 100%
+# TỰ ĐỘNG DÒ VỊ TRÍ SUB CHUẨN XÁC TỪNG BỘ PHIM
 def detect_sub_zone_smart(video_path: str, srt_file: str, model_choice: str = "gemini-3.7-flash"):
     items = parse_srt(srt_file)
     if not items:
         return 0.89, 0.985
     
-    # Lấy câu thoại ở khoảng 1/4 bộ phim (chắc chắn đang có cảnh hội thoại, chữ to rõ)
     sample_idx = min(len(items) - 1, max(1, len(items) // 4))
     start_sec, end_sec, _ = items[sample_idx]
     target_sec = (start_sec + end_sec) / 2.0
@@ -175,13 +181,12 @@ def detect_sub_zone_smart(video_path: str, srt_file: str, model_choice: str = "g
         
         y1, y2 = min(y1, y2), max(y1, y2)
         if 50 <= y1 < y2 <= 100 and (y2 - y1) >= 4:
-            # Nới rộng viền mờ thêm 1.5% ở mép trên và dưới để trùm kín viền bóng chữ
             y1_pct = max(0.50, (y1 - 1.5) / 100.0)
             y2_pct = min(1.00, (y2 + 1.5) / 100.0)
-            print(f"[✓] AI đã soi toạ độ dòng chữ phụ đề phim này: từ {y1_pct*100:.1f}% đến {y2_pct*100:.1f}%")
+            print(f"[✓] AI đã soi toạ độ sub phim này: từ {y1_pct*100:.1f}% đến {y2_pct*100:.1f}%")
             return y1_pct, y2_pct
     except Exception as e:
-        print(f"[!] Nhận diện vị trí tự động bị lỗi ({e}), chuyển sang toạ độ chuẩn đáy.")
+        print(f"[!] Dò vị trí tự động bị lỗi ({e}), chuyển sang toạ độ chuẩn đáy.")
         
     return 0.89, 0.985
 
@@ -237,16 +242,14 @@ def build_synced_tts_track(srt_file: str, voice_type: str, output_audio: str = "
         return output_audio
     return None
 
-# TỰ ĐỘNG DI CHUYỂN DẢI MỜ VÀ ĐẶT SUB VIỆT CHÍNH XÁC VÀO TÂM DẢI MỜ ĐÓ
+# KHÓA CHUẨN ÂM THANH XUẤT RA ĐỂ VIDEO KHÔNG BAO GIỜ BỊ 0 BYTE
 def render_final_video_auto(input_video, srt_file, tts_audio, output_final, sub_name, y1_pct, y2_pct, sub_fontsize=15, font_family="Comfortaa"):
     w, h = get_video_dimensions(input_video)
     
-    # Tính toạ độ hộp mờ ôm trọn dòng sub Trung được phát hiện
     y_start = (int(h * y1_pct) // 2) * 2
     crop_h = (int(h * (y2_pct - y1_pct)) // 2) * 2
     crop_h = max(24, min(crop_h, h - y_start))
 
-    # Căn phụ đề tiếng Việt tự động hạ/nâng đúng vào tâm giữa của hộp mờ đó
     y_center_box = y_start + (crop_h / 2.0)
     center_margin_v = max(4, int(h - y_center_box - (int(sub_fontsize) / 2)))
 
@@ -261,7 +264,6 @@ def render_final_video_auto(input_video, srt_file, tts_audio, output_final, sub_
     if "Roboto" in font_family: font_name = "Roboto"
     font_org_cmd = f":fontfile='{CJK_FONT}'" if os.path.exists(CJK_FONT) else ""
 
-    # LÀM MỜ MẠNH + PHỦ LỚP NỀN TỐI ĐỂ XOÁ SẠCH CHỮ TRUNG GỐC
     vf = (
         f"[0:v]split[m][c];"
         f"[c]crop=iw:{crop_h}:0:{y_start},boxblur=15:2,eq=brightness=-0.08[b];"
@@ -271,13 +273,59 @@ def render_final_video_auto(input_video, srt_file, tts_audio, output_final, sub_
         f"subtitles=filename='{srt_p}':force_style='FontName={font_name},FontSize={int(sub_fontsize)},Bold=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2.0,Alignment=2,MarginV={center_margin_v}'[vout]"
     )
 
+    has_orig = has_audio_stream(input_video)
+    
     if tts_audio and os.path.exists(tts_audio):
-        af = "[0:a]volume=0.15[bg];[1:a]volume=1.0[voice];[bg][voice]amix=inputs=2:duration=first:dropout_transition=0[aout]"
-        cmd = ["ffmpeg", "-y", "-i", input_video, "-i", tts_audio, "-filter_complex", f"{vf};{af}", "-map", "[vout]", "-map", "[aout]", "-c:v", "libx264", "-preset", "veryfast", "-crf", "19", output_final]
+        if has_orig:
+            af = (
+                "[0:a]volume=0.15[bg];"
+                "[1:a]volume=1.0[voice];"
+                "[bg][voice]amix=inputs=2:duration=first:dropout_transition=0,"
+                "aformat=channel_layouts=stereo:sample_rates=44100:sample_fmts=fltp[aout]"
+            )
+            cmd = [
+                "ffmpeg", "-y", "-i", input_video, "-i", tts_audio,
+                "-filter_complex", f"{vf};{af}",
+                "-map", "[vout]", "-map", "[aout]",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "19",
+                "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2",
+                output_final
+            ]
+        else:
+            af = "[1:a]aformat=channel_layouts=stereo:sample_rates=44100:sample_fmts=fltp[aout]"
+            cmd = [
+                "ffmpeg", "-y", "-i", input_video, "-i", tts_audio,
+                "-filter_complex", f"{vf};{af}",
+                "-map", "[vout]", "-map", "[aout]",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "19",
+                "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2",
+                output_final
+            ]
     else:
-        cmd = ["ffmpeg", "-y", "-i", input_video, "-filter_complex", vf, "-map", "[vout]", "-map", "0:a?", "-c:v", "libx264", "-preset", "veryfast", "-crf", "19", "-c:a", "copy", output_final]
+        if has_orig:
+            af = "[0:a]aformat=channel_layouts=stereo:sample_rates=44100:sample_fmts=fltp[aout]"
+            cmd = [
+                "ffmpeg", "-y", "-i", input_video,
+                "-filter_complex", f"{vf};{af}",
+                "-map", "[vout]", "-map", "[aout]",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "19",
+                "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2",
+                output_final
+            ]
+        else:
+            cmd = [
+                "ffmpeg", "-y", "-i", input_video,
+                "-filter_complex", vf,
+                "-map", "[vout]",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "19",
+                output_final
+            ]
 
-    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if res.returncode != 0 or not os.path.exists(output_final) or os.path.getsize(output_final) == 0:
+        if os.path.exists(output_final):
+            os.remove(output_final)
+        raise Exception(f"Lỗi FFmpeg: {res.stderr[-400:]}")
     return output_final
 
 def clean_trash():
@@ -304,6 +352,7 @@ def main():
         return
 
     print(f"🚀 Tìm thấy tổng cộng {len(video_files)} video. Bắt đầu xử lý...")
+    success_count = 0
 
     for idx, video_path in enumerate(video_files, 1):
         clean_trash()
@@ -315,15 +364,19 @@ def main():
 
         try:
             srt_p = get_srt_from_gemini_auto(video_path)
-            # TỰ ĐỘNG SOI ĐÚNG VỊ TRÍ SUB CỦA TỪNG BỘ PHIM
             y1, y2 = detect_sub_zone_smart(video_path, srt_p, CONFIG["models"][0])
             tts_p = build_synced_tts_track(srt_p, CONFIG["voice"])
             render_final_video_auto(video_path, srt_p, tts_p, out_name, CHANNEL_SUB_NAME, y1_pct=y1, y2_pct=y2, sub_fontsize=CONFIG["font_size"])
             print(f"[✓] HOÀN TẤT: {out_name}")
+            success_count += 1
         except Exception as e:
+            import traceback
             print(f"[❌] Lỗi khi xử lý {base_name}: {e}")
-            print("⏩ Nhảy sang video tiếp theo...")
+            traceback.print_exc()
         clean_trash()
+
+    if success_count == 0:
+        raise Exception("Không xuất được video nào thành công!")
 
     print("\n🎉 ĐÃ XỬ LÝ XONG TẤT CẢ VIDEO!")
 
