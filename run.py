@@ -15,9 +15,7 @@ CONFIG = {
     "models": ["gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.8-flash"],
     "voice": "CapCut - Nguồn Nhỏ Ngọt Ngào (BV421)",
     "font_family": "Comfortaa",
-    "font_size": 16,
-    "default_y1": 0.89,
-    "default_y2": 0.97
+    "font_size": 15,
 }
 
 YAN_BASE_INSTRUCTIONS = """
@@ -87,7 +85,6 @@ def parse_srt(srt_file: str):
         items.append((start, end, m.group(4).strip().replace('\n', ' ')))
     return items
 
-# CẤU HÌNH MAX TOKENS 65536 CHO PHIM DÀI 1 TIẾNG
 def get_srt_from_gemini_auto(video_path: str, model_list=CONFIG["models"], output_srt: str = "temp_sub.srt"):
     print("[*] Đang tải video lên bộ nhớ Gemini...")
     safe_video_path = "upload_for_gemini.mp4"
@@ -105,7 +102,7 @@ def get_srt_from_gemini_auto(video_path: str, model_list=CONFIG["models"], outpu
     )
     resp = None
     for model_name in model_list:
-        print(f"[*] AI đang xem và dịch video bằng {model_name}...")
+        print(f"[*] AI đang xem và dịch toàn bộ phim bằng {model_name}...")
         for attempt in range(1, 4):
             try:
                 r = client.models.generate_content(model=model_name, contents=[v_file, "Xuất SRT 1 dòng chuẩn theo quy tắc."], config=config)
@@ -123,29 +120,70 @@ def get_srt_from_gemini_auto(video_path: str, model_list=CONFIG["models"], outpu
     pure_srt = rebuild_pure_srt(resp.text)
     with open(output_srt, "w", encoding="utf-8") as f: f.write(pure_srt)
 
-    first_time_match = re.search(r'00:(\d{2}):(\d{2}),(\d{3})', pure_srt)
-    first_sec = 2.0
-    if first_time_match:
-        first_sec = int(first_time_match.group(1)) * 60 + int(first_time_match.group(2)) + 0.5
-    return output_srt, first_sec
+    return output_srt
 
-def detect_sub_zone_from_frame(video_path: str, timestamp_sec: float = 2.0, model_choice: str = "gemini-3.7-flash"):
-    img_path = "sub_sample.jpg"
-    subprocess.run(["ffmpeg", "-y", "-ss", str(timestamp_sec), "-i", video_path, "-vframes", "1", img_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    if not os.path.exists(img_path): return CONFIG["default_y1"], CONFIG["default_y2"]
+# TỰ ĐỘNG CHỤP ĐÚNG LÚC NHÂN VẬT NÓI ĐỂ SOI TOẠ ĐỘ SUB CHUẨN XÁC 100%
+def detect_sub_zone_smart(video_path: str, srt_file: str, model_choice: str = "gemini-3.7-flash"):
+    items = parse_srt(srt_file)
+    if not items:
+        return 0.89, 0.985
+    
+    # Lấy câu thoại ở khoảng 1/4 bộ phim (chắc chắn đang có cảnh hội thoại, chữ to rõ)
+    sample_idx = min(len(items) - 1, max(1, len(items) // 4))
+    start_sec, end_sec, _ = items[sample_idx]
+    target_sec = (start_sec + end_sec) / 2.0
+    
+    img_path = "sub_detect_sample.jpg"
+    subprocess.run(
+        ["ffmpeg", "-y", "-ss", f"{target_sec:.2f}", "-i", video_path, "-vframes", "1", img_path],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+    
+    if not os.path.exists(img_path):
+        return 0.89, 0.985
+        
     try:
-        with open(img_path, "rb") as f: img_bytes = f.read()
+        with open(img_path, "rb") as f:
+            img_bytes = f.read()
+        
+        prompt = (
+            "Hãy nhìn vào ảnh chụp từ tập phim này và tìm vị trí của dòng chữ phụ đề tiếng Trung gốc ở nửa dưới màn hình. "
+            "Báo toạ độ dọc từ mép trên của dòng chữ đến mép dưới của dòng chữ theo phần trăm chiều cao ảnh (0 là đỉnh cao nhất, 100 là sát đáy màn hình). "
+            "Chỉ trả về duy nhất chuỗi JSON: {\"y_start\": <số nguyên từ 50 đến 98>, \"y_end\": <số nguyên từ 60 đến 100>}. "
+            "Ví dụ: {\"y_start\": 88, \"y_end\": 97}"
+        )
+        
         res = client.models.generate_content(
             model=model_choice,
-            contents=[types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"), "Hãy nhìn vào dòng chữ phụ đề tiếng Trung chạy dưới đáy ảnh. Báo chính xác 2 số phần trăm: y_start, y_end tính từ đỉnh ảnh xuống."]
+            contents=[
+                types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"),
+                prompt
+            ],
+            config=types.GenerateContentConfig(temperature=0.1)
         ).text
-        nums = re.findall(r'\d+', res)
-        if len(nums) >= 2:
-            y1, y2 = int(nums[0]) / 100.0, int(nums[1]) / 100.0
-            y1, y2 = min(y1, y2), max(y1, y2)
-            if 0.70 <= y1 < y2 <= 1.0: return y1, y2
-    except: pass
-    return CONFIG["default_y1"], CONFIG["default_y2"]
+        
+        match = re.search(r'\{\s*"y_start"\s*:\s*(\d+)\s*,\s*"y_end"\s*:\s*(\d+)\s*\}', res)
+        if match:
+            y1 = int(match.group(1))
+            y2 = int(match.group(2))
+        else:
+            nums = [int(n) for n in re.findall(r'\d+', res) if 50 <= int(n) <= 100]
+            if len(nums) >= 2:
+                y1, y2 = nums[0], nums[1]
+            else:
+                return 0.89, 0.985
+        
+        y1, y2 = min(y1, y2), max(y1, y2)
+        if 50 <= y1 < y2 <= 100 and (y2 - y1) >= 4:
+            # Nới rộng viền mờ thêm 1.5% ở mép trên và dưới để trùm kín viền bóng chữ
+            y1_pct = max(0.50, (y1 - 1.5) / 100.0)
+            y2_pct = min(1.00, (y2 + 1.5) / 100.0)
+            print(f"[✓] AI đã soi toạ độ dòng chữ phụ đề phim này: từ {y1_pct*100:.1f}% đến {y2_pct*100:.1f}%")
+            return y1_pct, y2_pct
+    except Exception as e:
+        print(f"[!] Nhận diện vị trí tự động bị lỗi ({e}), chuyển sang toạ độ chuẩn đáy.")
+        
+    return 0.89, 0.985
 
 def generate_voice_file(text: str, voice_type: str, out_p: str) -> bool:
     import edge_tts
@@ -199,14 +237,18 @@ def build_synced_tts_track(srt_file: str, voice_type: str, output_audio: str = "
         return output_audio
     return None
 
-def render_final_video_auto(input_video, srt_file, tts_audio, output_final, sub_name, y1_pct, y2_pct, sub_fontsize=16, font_family="Comfortaa"):
+# TỰ ĐỘNG DI CHUYỂN DẢI MỜ VÀ ĐẶT SUB VIỆT CHÍNH XÁC VÀO TÂM DẢI MỜ ĐÓ
+def render_final_video_auto(input_video, srt_file, tts_audio, output_final, sub_name, y1_pct, y2_pct, sub_fontsize=15, font_family="Comfortaa"):
     w, h = get_video_dimensions(input_video)
+    
+    # Tính toạ độ hộp mờ ôm trọn dòng sub Trung được phát hiện
     y_start = (int(h * y1_pct) // 2) * 2
     crop_h = (int(h * (y2_pct - y1_pct)) // 2) * 2
     crop_h = max(24, min(crop_h, h - y_start))
 
-    y_center_pct = (y1_pct + y2_pct) / 2.0
-    center_margin_v = max(4, int((1.0 - y_center_pct) * 288 - (int(sub_fontsize) / 4)))
+    # Căn phụ đề tiếng Việt tự động hạ/nâng đúng vào tâm giữa của hộp mờ đó
+    y_center_box = y_start + (crop_h / 2.0)
+    center_margin_v = max(4, int(h - y_center_box - (int(sub_fontsize) / 2)))
 
     t_sub = sub_name.replace("'", "").replace(":", " -")
     srt_p = os.path.abspath(srt_file).replace("\\", "/")
@@ -219,9 +261,10 @@ def render_final_video_auto(input_video, srt_file, tts_audio, output_final, sub_
     if "Roboto" in font_family: font_name = "Roboto"
     font_org_cmd = f":fontfile='{CJK_FONT}'" if os.path.exists(CJK_FONT) else ""
 
+    # LÀM MỜ MẠNH + PHỦ LỚP NỀN TỐI ĐỂ XOÁ SẠCH CHỮ TRUNG GỐC
     vf = (
         f"[0:v]split[m][c];"
-        f"[c]crop=iw:{crop_h}:0:{y_start},gblur=sigma=15[b];"
+        f"[c]crop=iw:{crop_h}:0:{y_start},boxblur=15:2,eq=brightness=-0.08[b];"
         f"[m][b]overlay=0:{y_start}:enable='{en_str}'[v1];"
         f"[v1]drawtext=text='sub - {t_sub}':x=25:y=25{font_org_cmd}:fontcolor=white:shadowcolor=black:shadowx=1:shadowy=1,"
         f"drawtext=text='{t_sub}':x='mod(t*65,w+tw)-tw':y='mod(t*32,h+th)-th':fontsize=20:fontcolor=white@0.10,"
@@ -239,7 +282,7 @@ def render_final_video_auto(input_video, srt_file, tts_audio, output_final, sub_
 
 def clean_trash():
     shutil.rmtree("temp_tts", ignore_errors=True)
-    for f in ["upload_for_gemini.mp4", "temp_sub.srt", "full_tts.wav", "sub_sample.jpg"]:
+    for f in ["upload_for_gemini.mp4", "temp_sub.srt", "full_tts.wav", "sub_detect_sample.jpg"]:
         if os.path.exists(f): 
             try: os.remove(f)
             except: pass
@@ -271,10 +314,11 @@ def main():
         print(f"=======================================================")
 
         try:
-            srt_p, first_sec = get_srt_from_gemini_auto(video_path)
-            y1, y2 = detect_sub_zone_from_frame(video_path, first_sec, CONFIG["models"][0])
+            srt_p = get_srt_from_gemini_auto(video_path)
+            # TỰ ĐỘNG SOI ĐÚNG VỊ TRÍ SUB CỦA TỪNG BỘ PHIM
+            y1, y2 = detect_sub_zone_smart(video_path, srt_p, CONFIG["models"][0])
             tts_p = build_synced_tts_track(srt_p, CONFIG["voice"])
-            render_final_video_auto(video_path, srt_p, tts_p, out_name, CHANNEL_SUB_NAME, y1, y2)
+            render_final_video_auto(video_path, srt_p, tts_p, out_name, CHANNEL_SUB_NAME, y1_pct=y1, y2_pct=y2, sub_fontsize=CONFIG["font_size"])
             print(f"[✓] HOÀN TẤT: {out_name}")
         except Exception as e:
             print(f"[❌] Lỗi khi xử lý {base_name}: {e}")
